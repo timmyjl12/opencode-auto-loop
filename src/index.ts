@@ -52,11 +52,13 @@ function copyIfChanged(src: string, dest: string): void {
   cpSync(src, dest, { recursive: true });
 }
 
-// Auto-copy skills and commands to opencode config, updating if content changed
-function setupSkillsAndCommands(log: LogFn): void {
+// Auto-copy skills and commands to opencode config, updating if content changed.
+// Returns true if any new files were copied (first install), false otherwise.
+function setupSkillsAndCommands(log: LogFn): boolean {
   const pluginRoot = getPluginRoot();
   const skillsDir = join(OPENCODE_CONFIG_DIR, "skill");
   const commandsDir = join(OPENCODE_CONFIG_DIR, "command");
+  let newFilesCopied = false;
 
   // Copy skills
   const pluginSkillsDir = join(pluginRoot, "skills");
@@ -65,8 +67,10 @@ function setupSkillsAndCommands(log: LogFn): void {
     for (const skill of skills) {
       const srcFile = join(pluginSkillsDir, skill, "SKILL.md");
       const destFile = join(skillsDir, skill, "SKILL.md");
+      const isNew = !existsSync(destFile);
       try {
         copyIfChanged(srcFile, destFile);
+        if (isNew && existsSync(destFile)) newFilesCopied = true;
       } catch (err) {
         log("warn", `Failed to copy skill '${skill}': ${err}`);
       }
@@ -78,13 +82,18 @@ function setupSkillsAndCommands(log: LogFn): void {
   if (existsSync(pluginCommandsDir)) {
     const commands = ["auto-loop.md", "cancel-auto-loop.md", "auto-loop-help.md"];
     for (const cmd of commands) {
+      const destCmd = join(commandsDir, cmd);
+      const isNew = !existsSync(destCmd);
       try {
-        copyIfChanged(join(pluginCommandsDir, cmd), join(commandsDir, cmd));
+        copyIfChanged(join(pluginCommandsDir, cmd), destCmd);
+        if (isNew && existsSync(destCmd)) newFilesCopied = true;
       } catch (err) {
         log("warn", `Failed to copy command '${cmd}': ${err}`);
       }
     }
   }
+
+  return newFilesCopied;
 }
 
 // Get state file path (project-relative)
@@ -366,8 +375,12 @@ export const AutoLoopPlugin: Plugin = async (ctx) => {
     }
   };
 
-  // Auto-setup skills and commands
-  setupSkillsAndCommands(log);
+  // Auto-setup skills and commands — notify on first install
+  const isFirstInstall = setupSkillsAndCommands(log);
+  if (isFirstInstall) {
+    toast("Auto Loop installed — restart opencode to enable /auto-loop commands", "warning");
+    log("info", "First install detected — commands copied, restart needed for slash commands");
+  }
 
   // Debounce tracking for idle events
   let lastContinuation = 0;
