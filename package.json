@@ -1,0 +1,38 @@
+{
+  "name": "opencode-auto-loop",
+  "version": "0.1.0",
+  "description": "Auto-continue for OpenCode",
+  "main": "src/index.ts",
+  "type": "module",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "auto-continue",
+    "auto-loop",
+    "iteration-loop"
+  ],
+  "author": "Tim Lang",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/timmyjl12/opencode-auto-loop"
+  },
+  "bugs": {
+    "url": "https://github.com/timmyjl12/opencode-auto-loop/issues"
+  },
+  "homepage": "https://github.com/timmyjl12/opencode-auto-loop#readme",
+  "files": [
+    "src/",
+    "commands/",
+    "skills/"
+  ],
+  "dependencies": {
+    "@opencode-ai/plugin": "^0.15.31"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0"
+  }
+}

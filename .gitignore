@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# Don't commit local state files
+auto-loop.local.md
+.opencode/
