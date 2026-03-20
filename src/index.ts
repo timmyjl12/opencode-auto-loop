@@ -30,7 +30,7 @@ type OpencodeClient = PluginInput["client"];
 const SERVICE_NAME = "auto-loop";
 const STATE_FILENAME = "auto-loop.local.md";
 const OPENCODE_CONFIG_DIR = join(homedir(), ".config/opencode");
-const COMPLETION_TAG = /<promise>\s*DONE\s*<\/promise>/is;
+const COMPLETION_TAG = /^\s*<promise>\s*DONE\s*<\/promise>\s*$/im;
 const DEBOUNCE_MS = 2000;
 
 // Get plugin root directory (ESM only — package is "type": "module")
@@ -191,9 +191,11 @@ function clearState(directory: string, log: LogFn): void {
   }
 }
 
-// Strip markdown code fences before checking for completion tag
+// Strip markdown code fences and inline code before checking for completion tag
 function stripCodeFences(text: string): string {
-  return text.replace(/```[\s\S]*?```/g, "");
+  return text
+    .replace(/```[\s\S]*?```/g, "") // triple-backtick blocks
+    .replace(/`[^`]+`/g, "");       // inline backtick code
 }
 
 // Extract text from the last assistant message in a session
@@ -416,7 +418,9 @@ export const AutoLoopPlugin: Plugin = async (ctx) => {
 
 Task: ${task}
 
-I will auto-continue until the task is complete. Before going idle each iteration, I will output structured progress:
+**Begin working on the task now.** The loop will auto-continue until you signal completion.
+
+Before going idle each iteration, output structured progress:
 
 \`\`\`
 ## Completed
@@ -426,7 +430,7 @@ I will auto-continue until the task is complete. Before going idle each iteratio
 - [ ] What remains (in priority order)
 \`\`\`
 
-When fully done, I will output \`<promise>DONE</promise>\` to signal completion.
+When the task is FULLY and VERIFIABLY complete, output the completion signal on its own line (the promise-DONE XML tag). Do NOT mention or echo the completion tag until you are truly done.
 
 Use /cancel-auto-loop to stop early.`;
         },
@@ -493,7 +497,9 @@ Located at: .opencode/auto-loop.local.md`;
         // Fetch last assistant message (used for completion check + progress extraction)
         const lastText = await getLastAssistantText(client, sessionId, directory, log);
 
-        if (lastText && checkCompletion(lastText)) {
+        // Skip completion check on iteration 0 (first idle after loop start)
+        // to avoid false positives from the tool's initial response text
+        if (state.iteration > 0 && lastText && checkCompletion(lastText)) {
           clearState(directory, log);
           log("info", `Loop completed at iteration ${state.iteration}`);
           toast(`Auto Loop completed after ${state.iteration} iteration(s)`, "success");
