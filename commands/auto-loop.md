@@ -23,7 +23,7 @@ After the tool confirms the loop is active, **immediately begin working on the t
 
 ## Progress Tracking
 
-Before going idle, you MUST output structured progress so the plugin knows where you left off:
+Before going idle, you MUST output structured progress AND a status line so the plugin knows where you left off:
 
 ```markdown
 ## Completed
@@ -31,15 +31,25 @@ Before going idle, you MUST output structured progress so the plugin knows where
 
 ## Next Steps
 - [ ] What needs to be done next (in priority order)
+
+STATUS: IN_PROGRESS
 ```
 
 ## Completion
 
-When the task is FULLY completed, signal completion by outputting the promise-DONE XML tag on its own line:
+When the task is FULLY completed with NO remaining next steps, signal completion:
+
+```
+STATUS: COMPLETE
 
 <promise>DONE</promise>
+```
 
-**IMPORTANT:** ONLY output this when the task is COMPLETELY and VERIFIABLY finished. Do NOT output false promises to escape the loop.
+**IMPORTANT:**
+- ONLY output `STATUS: COMPLETE` and the DONE signal when the task is COMPLETELY and VERIFIABLY finished.
+- Do NOT output the DONE signal if there are ANY unchecked items (`- [ ]`) in your Next Steps — the plugin WILL reject it.
+- If `STATUS: IN_PROGRESS` is present alongside a DONE signal, the plugin will reject it.
+- Do NOT output false promises to escape the loop.
 
 ## Cancellation
 

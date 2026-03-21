@@ -31,6 +31,8 @@ const SERVICE_NAME = "auto-loop";
 const STATE_FILENAME = "auto-loop.local.md";
 const OPENCODE_CONFIG_DIR = join(homedir(), ".config/opencode");
 const COMPLETION_TAG = /^\s*<promise>\s*DONE\s*<\/promise>\s*$/im;
+const STATUS_COMPLETE_TAG = /^\s*STATUS:\s*COMPLETE\s*$/im;
+const STATUS_IN_PROGRESS_TAG = /^\s*STATUS:\s*IN_PROGRESS\s*$/im;
 const DEFAULT_DEBOUNCE_MS = 2000;
 const DEFAULT_MAX_ITERATIONS = 25;
 
@@ -247,6 +249,65 @@ function checkCompletion(text: string): boolean {
   return COMPLETION_TAG.test(stripCodeFences(text));
 }
 
+// Extract the STATUS signal presence from text.
+function getStatusSignals(text: string): {
+  hasComplete: boolean;
+  hasInProgress: boolean;
+} {
+  const cleaned = stripCodeFences(text);
+  return {
+    hasComplete: STATUS_COMPLETE_TAG.test(cleaned),
+    hasInProgress: STATUS_IN_PROGRESS_TAG.test(cleaned),
+  };
+}
+
+// Check if the parsed Next Steps section contains unchecked items (- [ ] ...).
+// Returns true if there are incomplete items, meaning the task is NOT done.
+function hasIncompleteSteps(text: string): boolean {
+  const nextSteps = extractNextSteps(stripCodeFences(text));
+  if (!nextSteps) return false;
+
+  const uncheckedItems = nextSteps
+    .split("\n")
+    .filter((line) => /^\s*-\s*\[ \]/.test(line));
+
+  return uncheckedItems.length > 0;
+}
+
+// Validate whether the DONE signal should be honored.
+// Returns { valid: true } if completion is legitimate,
+// or { valid: false, reason: string } if it should be rejected.
+function validateCompletion(text: string): { valid: boolean; reason?: string } {
+  // Check 1: contradictory STATUS signals
+  const statusSignals = getStatusSignals(text);
+  if (statusSignals.hasComplete && statusSignals.hasInProgress) {
+    return {
+      valid: false,
+      reason: "Both STATUS: COMPLETE and STATUS: IN_PROGRESS are present",
+    };
+  }
+
+  // Check 2: STATUS signal contradicts DONE
+  if (statusSignals.hasInProgress) {
+    return {
+      valid: false,
+      reason: "STATUS: IN_PROGRESS contradicts the DONE signal",
+    };
+  }
+
+  // Check 3: Unchecked next steps exist
+  if (hasIncompleteSteps(text)) {
+    return {
+      valid: false,
+      reason: "Unchecked next steps (- [ ] ...) found alongside DONE signal",
+    };
+  }
+
+  // Check 4: If STATUS signal is present and is COMPLETE, extra confidence
+  // If no STATUS signal at all, still allow (backward compatibility)
+  return { valid: true };
+}
+
 // Extract next steps / TODOs from assistant message text
 // Looks for common patterns: ## Next Steps, ## TODO, checkbox lists, numbered lists after keywords
 function extractNextSteps(text: string): string | undefined {
@@ -355,9 +416,12 @@ function buildLoopContextReminder(state: LoopState): string {
 
 Original task: ${state.prompt || "(no task specified)"}
 ${progress}
-When the task is FULLY complete, you MUST output: <promise>DONE</promise>
-Before going idle, list your progress using ## Completed and ## Next Steps sections.
-Do NOT output false completion promises. If blocked, explain the blocker.`;
+IMPORTANT RULES:
+- Before going idle, output ## Completed and ## Next Steps sections
+- You MUST include a STATUS line: either \`STATUS: IN_PROGRESS\` or \`STATUS: COMPLETE\` on its own line
+- Do NOT output <promise>DONE</promise> if there are ANY unchecked items (\`- [ ]\`) in your Next Steps — the plugin WILL reject it
+- Only output \`STATUS: COMPLETE\` and the DONE signal when ALL steps are truly finished and Next Steps is empty
+- Do NOT output false completion promises. If blocked, output \`STATUS: IN_PROGRESS\` and explain the blocker.`;
 }
 
 // Check if session is currently busy (not idle)
@@ -466,7 +530,7 @@ Task: ${task}
 
 **Begin working on the task now.** The loop will auto-continue until you signal completion.
 
-Before going idle each iteration, output structured progress:
+Before going idle each iteration, output structured progress AND a status line:
 
 \`\`\`
 ## Completed
@@ -474,9 +538,18 @@ Before going idle each iteration, output structured progress:
 
 ## Next Steps
 - [ ] What remains (in priority order)
+
+STATUS: IN_PROGRESS
 \`\`\`
 
-When the task is FULLY and VERIFIABLY complete, output the completion signal on its own line (the promise-DONE XML tag). Do NOT mention or echo the completion tag until you are truly done.
+## Completion Rules — READ CAREFULLY
+
+1. **If your Next Steps list has ANY unchecked items (\`- [ ]\`), you MUST NOT output the DONE signal.** The plugin will reject it.
+2. You MUST include a \`STATUS: COMPLETE\` or \`STATUS: IN_PROGRESS\` line on its own line in every response.
+3. Only when ALL steps are done and Next Steps is empty, output:
+   - \`STATUS: COMPLETE\` on its own line
+   - The promise-DONE XML tag on its own line
+4. If you are blocked or stuck, output \`STATUS: IN_PROGRESS\` and explain the blocker. Do NOT output a false DONE.
 
 Use /cancel-auto-loop to stop early.`;
         },
@@ -561,10 +634,19 @@ Located at: .opencode/auto-loop.local.md`;
         // Skip completion check on iteration 0 (first idle after loop start)
         // to avoid false positives from the tool's initial response text
         if (state.iteration > 0 && lastText && checkCompletion(lastText)) {
-          await clearState(directory, log);
-          log("info", `Loop completed at iteration ${state.iteration}`);
-          toast(`Auto Loop completed after ${state.iteration} iteration(s)`, "success");
-          return;
+          // Validate the DONE signal — reject if there are unchecked steps
+          // or if the STATUS signal contradicts completion
+          const validation = validateCompletion(lastText);
+          if (validation.valid) {
+            await clearState(directory, log);
+            log("info", `Loop completed at iteration ${state.iteration}`);
+            toast(`Auto Loop completed after ${state.iteration} iteration(s)`, "success");
+            return;
+          } else {
+            log("warn", `Rejected premature DONE signal: ${validation.reason}`);
+            toast(`Auto Loop: DONE rejected — ${validation.reason}`, "warning");
+            // Fall through to send another continuation prompt
+          }
         }
 
         if (state.iteration >= state.maxIterations) {
@@ -597,8 +679,10 @@ Continue working on the task. Do NOT repeat work that is already done.
 ${progressSection}
 IMPORTANT:
 - Pick up from the next incomplete step below
-- When FULLY complete, output: <promise>DONE</promise>
 - Before going idle, list your progress using ## Completed and ## Next Steps sections
+- You MUST include a STATUS line: either \`STATUS: IN_PROGRESS\` or \`STATUS: COMPLETE\` on its own line
+- Do NOT output <promise>DONE</promise> if there are ANY unchecked items (\`- [ ]\`) in your Next Steps — the plugin WILL reject it
+- Only output \`STATUS: COMPLETE\` and the DONE signal when ALL steps are truly finished and Next Steps is empty
 - Do not stop until the task is truly done
 
 Original task:

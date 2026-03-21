@@ -27,7 +27,7 @@ After the tool confirms the loop is active, **immediately begin working on the t
 
 ## Progress Tracking - CRITICAL
 
-**Before going idle at the end of each work session, you MUST output structured progress sections.** The plugin parses these to persist your TODOs across iterations so you know exactly where to pick up.
+**Before going idle at the end of each work session, you MUST output structured progress sections AND a status line.** The plugin parses these to persist your TODOs across iterations so you know exactly where to pick up.
 
 Use this format in your final message of each iteration:
 
@@ -41,6 +41,8 @@ Use this format in your final message of each iteration:
 - [ ] Add JWT authentication middleware
 - [ ] Create registration endpoint
 - [ ] Write integration tests
+
+STATUS: IN_PROGRESS
 ```
 
 **Rules:**
@@ -48,6 +50,7 @@ Use this format in your final message of each iteration:
 - Be specific — each item should be a concrete, actionable step
 - Only list truly completed items under ## Completed
 - Order ## Next Steps by priority — the continuation will tell you to start from the top
+- You MUST include a `STATUS: IN_PROGRESS` or `STATUS: COMPLETE` line on its own line in EVERY response
 - The plugin extracts these sections and writes them into `auto-loop.local.md` for the next iteration
 
 ## Completion Signal - CRITICAL RULES
@@ -55,16 +58,20 @@ Use this format in your final message of each iteration:
 When you have FULLY completed the task, signal completion by outputting the promise-DONE XML tag on its own line:
 
 ```
+STATUS: COMPLETE
+
 <promise>DONE</promise>
 ```
 
 **IMPORTANT CONSTRAINTS:**
 
+- **If your Next Steps list has ANY unchecked items (`- [ ]`), you MUST NOT output the DONE signal.** The plugin will detect the contradiction and REJECT the completion, forcing another iteration.
+- You MUST output `STATUS: COMPLETE` (on its own line) alongside the DONE signal. If the plugin detects `STATUS: IN_PROGRESS` with a DONE signal, it will reject the completion.
 - ONLY output the completion signal when the task is COMPLETELY and VERIFIABLY finished
 - The completion tag MUST be on its own line (not inline with other text)
 - Do NOT mention or echo the completion tag in explanatory text — only output it as the actual signal
 - Do NOT output false completion signals to escape the loop, even if you think you're stuck
-- If you're blocked, explain the blocker and request help instead of falsely completing
+- If you're blocked, output `STATUS: IN_PROGRESS` and explain the blocker instead of falsely completing
 
 The loop can only be stopped by:
 1. Truthful completion signal
