@@ -78,6 +78,16 @@ The loop can only be stopped by:
 2. Max iterations reached
 3. User running `/cancel-auto-loop`
 
+## Force Mode (--ralph)
+
+When started with `--ralph`, the loop ignores ALL completion signals (`<promise>DONE</promise>`, `STATUS: COMPLETE`) and runs for the full iteration count. In force mode:
+- You do NOT need to output `STATUS:` lines or the DONE signal
+- The loop will continue for all iterations regardless
+- Focus on making steady progress each iteration
+- Still output `## Completed` and `## Next Steps` sections so the plugin can track progress
+
+Example: `/auto-loop --ralph --max 10 Continue the refactoring task`
+
 ## Checking Status
 
 Check current iteration and progress:

@@ -16,6 +16,7 @@ interface LoopState {
   iteration: number;
   maxIterations: number;
   debounceMs: number;
+  forceLoop?: boolean;
   sessionId?: string;
   prompt?: string;
   completed?: string;
@@ -124,6 +125,7 @@ function parseState(content: string): LoopState {
     if (key === "iteration") state.iteration = parseInt(value) || 0;
     if (key === "maxIterations") state.maxIterations = parseInt(value) || DEFAULT_MAX_ITERATIONS;
     if (key === "debounceMs") state.debounceMs = parseInt(value) || DEFAULT_DEBOUNCE_MS;
+    if (key === "forceLoop") state.forceLoop = value === "true";
     if (key === "sessionId") state.sessionId = value || undefined;
   }
 
@@ -159,6 +161,7 @@ function serializeState(state: LoopState): string {
     `maxIterations: ${state.maxIterations}`,
     `debounceMs: ${state.debounceMs}`,
   ];
+  if (state.forceLoop) lines.push(`forceLoop: ${state.forceLoop}`);
   if (state.sessionId) lines.push(`sessionId: ${state.sessionId}`);
   lines.push("---");
   if (state.prompt) lines.push("", state.prompt);
@@ -412,16 +415,24 @@ function buildProgressSection(state: LoopState): string {
 // Build the loop context reminder for post-compaction injection
 function buildLoopContextReminder(state: LoopState): string {
   const progress = buildProgressSection(state);
-  return `[AUTO LOOP ACTIVE — Iteration ${state.iteration}/${state.maxIterations}]
-
-Original task: ${state.prompt || "(no task specified)"}
-${progress}
-IMPORTANT RULES:
+  const forceLabel = state.forceLoop ? " [FORCE MODE]" : "";
+  const rules = state.forceLoop
+    ? `IMPORTANT RULES:
+- Before going idle, output ## Completed and ## Next Steps sections
+- FORCE MODE is active — the loop will continue for all ${state.maxIterations} iterations regardless of completion signals
+- Focus on making steady progress each iteration`
+    : `IMPORTANT RULES:
 - Before going idle, output ## Completed and ## Next Steps sections
 - You MUST include a STATUS line: either \`STATUS: IN_PROGRESS\` or \`STATUS: COMPLETE\` on its own line
 - Do NOT output <promise>DONE</promise> if there are ANY unchecked items (\`- [ ]\`) in your Next Steps — the plugin WILL reject it
 - Only output \`STATUS: COMPLETE\` and the DONE signal when ALL steps are truly finished and Next Steps is empty
 - Do NOT output false completion promises. If blocked, output \`STATUS: IN_PROGRESS\` and explain the blocker.`;
+
+  return `[AUTO LOOP${forceLabel} ACTIVE — Iteration ${state.iteration}/${state.maxIterations}]
+
+Original task: ${state.prompt || "(no task specified)"}
+${progress}
+${rules}`;
 }
 
 // Check if session is currently busy (not idle)
@@ -504,8 +515,12 @@ export const AutoLoopPlugin: Plugin = async (ctx) => {
             .number()
             .optional()
             .describe("Debounce delay between iterations in ms (default: 2000)"),
+          forceLoop: tool.schema
+            .boolean()
+            .optional()
+            .describe("Force mode (--ralph): ignore completion signals and run for all iterations"),
         },
-        async execute({ task, maxIterations = DEFAULT_MAX_ITERATIONS, debounceMs = DEFAULT_DEBOUNCE_MS }, context) {
+        async execute({ task, maxIterations = DEFAULT_MAX_ITERATIONS, debounceMs = DEFAULT_DEBOUNCE_MS, forceLoop = false }, context) {
           if (context.abort.aborted) return "Auto Loop start was cancelled.";
 
           const state: LoopState = {
@@ -513,6 +528,7 @@ export const AutoLoopPlugin: Plugin = async (ctx) => {
             iteration: 0,
             maxIterations,
             debounceMs,
+            forceLoop: forceLoop ? true : undefined,
             sessionId: context.sessionID,
             prompt: task,
           };
@@ -521,16 +537,21 @@ export const AutoLoopPlugin: Plugin = async (ctx) => {
           continuationInFlight = false;
           lastContinuation = 0;
 
-          log("info", `Loop started for session ${context.sessionID}`);
-          toast(`Auto Loop started (max ${maxIterations} iterations)`, "success");
+          const modeLabel = forceLoop ? " [FORCE MODE]" : "";
+          log("info", `Loop started${modeLabel} for session ${context.sessionID}`);
+          toast(`Auto Loop started${modeLabel} (max ${maxIterations} iterations)`, "success");
 
-          return `Auto Loop started (max ${maxIterations} iterations).
+          const forceNote = forceLoop
+            ? `\n\n**FORCE MODE (--ralph):** Completion signals are IGNORED. The loop will run for all ${maxIterations} iterations regardless. Focus on making progress each iteration — you do NOT need to output STATUS or DONE signals.`
+            : "";
+
+          return `Auto Loop started (max ${maxIterations} iterations).${forceNote}
 
 Task: ${task}
 
-**Begin working on the task now.** The loop will auto-continue until you signal completion.
+**Begin working on the task now.** The loop will auto-continue until ${forceLoop ? `all ${maxIterations} iterations are used` : "you signal completion"}.
 
-Before going idle each iteration, output structured progress AND a status line:
+Before going idle each iteration, output structured progress${forceLoop ? "" : " AND a status line"}:
 
 \`\`\`
 ## Completed
@@ -538,10 +559,9 @@ Before going idle each iteration, output structured progress AND a status line:
 
 ## Next Steps
 - [ ] What remains (in priority order)
-
-STATUS: IN_PROGRESS
+${forceLoop ? "" : "\nSTATUS: IN_PROGRESS"}
 \`\`\`
-
+${forceLoop ? "" : `
 ## Completion Rules — READ CAREFULLY
 
 1. **If your Next Steps list has ANY unchecked items (\`- [ ]\`), you MUST NOT output the DONE signal.** The plugin will reject it.
@@ -550,7 +570,7 @@ STATUS: IN_PROGRESS
    - \`STATUS: COMPLETE\` on its own line
    - The promise-DONE XML tag on its own line
 4. If you are blocked or stuck, output \`STATUS: IN_PROGRESS\` and explain the blocker. Do NOT output a false DONE.
-
+`}
 Use /cancel-auto-loop to stop early.`;
         },
       }),
@@ -585,6 +605,8 @@ Use /cancel-auto-loop to stop early.`;
 
 - \`/auto-loop <task>\` - Start an auto-continuation loop (default: 25 iterations)
 - \`/auto-loop <task> --max <n>\` - Start with a custom iteration limit
+- \`/auto-loop <task> --ralph\` - Force mode: ignore completion signals, run all iterations
+- \`/auto-loop <task> --ralph --max <n>\` - Force mode with custom limit
 - \`/cancel-auto-loop\` - Stop an active loop
 - \`/auto-loop-help\` - Show this help
 
@@ -592,6 +614,8 @@ Use /cancel-auto-loop to stop early.`;
 
 - \`/auto-loop Build a REST API\` — runs up to 25 iterations
 - \`/auto-loop Fix all lint errors --max 10\` — runs up to 10 iterations
+- \`/auto-loop --ralph Continue refactoring\` — force runs all 25 iterations, ignores DONE signals
+- \`/auto-loop --ralph --max 50 Big migration\` — force runs all 50 iterations
 
 ## How It Works
 
@@ -599,6 +623,13 @@ Use /cancel-auto-loop to stop early.`;
 2. AI works on the task until idle
 3. Plugin auto-continues if not complete
 4. Loop stops when AI outputs: <promise>DONE</promise>
+
+## Force Mode (--ralph)
+
+When \`--ralph\` is used, the loop ignores ALL completion signals and runs for the full iteration count. Useful when:
+- You got interrupted and want to continue no matter what
+- You want the AI to keep iterating and improving
+- You don't want the AI to stop early
 
 ## State File
 
@@ -632,8 +663,10 @@ Located at: .opencode/auto-loop.local.md`;
         const lastText = await getLastAssistantText(client, sessionId, directory, log);
 
         // Skip completion check on iteration 0 (first idle after loop start)
-        // to avoid false positives from the tool's initial response text
-        if (state.iteration > 0 && lastText && checkCompletion(lastText)) {
+        // to avoid false positives from the tool's initial response text.
+        // Also skip entirely when forceLoop is true — force mode ignores
+        // all completion signals and runs until max iterations.
+        if (!state.forceLoop && state.iteration > 0 && lastText && checkCompletion(lastText)) {
           // Validate the DONE signal — reject if there are unchecked steps
           // or if the STATUS signal contradicts completion
           const validation = validateCompletion(lastText);
@@ -673,17 +706,26 @@ Located at: .opencode/auto-loop.local.md`;
         // Build continuation prompt with progress context
         const progressSection = buildProgressSection(newState);
 
-        const continuationPrompt = `[AUTO LOOP — ITERATION ${newState.iteration}/${newState.maxIterations}]
-
-Continue working on the task. Do NOT repeat work that is already done.
-${progressSection}
-IMPORTANT:
+        const forceLabel = state.forceLoop ? " [FORCE MODE]" : "";
+        const importantRules = state.forceLoop
+          ? `IMPORTANT:
+- Pick up from the next incomplete step below
+- Before going idle, list your progress using ## Completed and ## Next Steps sections
+- FORCE MODE is active — the loop will continue for all ${newState.maxIterations} iterations regardless of completion signals
+- Focus on making steady progress each iteration`
+          : `IMPORTANT:
 - Pick up from the next incomplete step below
 - Before going idle, list your progress using ## Completed and ## Next Steps sections
 - You MUST include a STATUS line: either \`STATUS: IN_PROGRESS\` or \`STATUS: COMPLETE\` on its own line
 - Do NOT output <promise>DONE</promise> if there are ANY unchecked items (\`- [ ]\`) in your Next Steps — the plugin WILL reject it
 - Only output \`STATUS: COMPLETE\` and the DONE signal when ALL steps are truly finished and Next Steps is empty
-- Do not stop until the task is truly done
+- Do not stop until the task is truly done`;
+
+        const continuationPrompt = `[AUTO LOOP${forceLabel} — ITERATION ${newState.iteration}/${newState.maxIterations}]
+
+Continue working on the task. Do NOT repeat work that is already done.
+${progressSection}
+${importantRules}
 
 Original task:
 ${state.prompt || "(no task specified)"}`;

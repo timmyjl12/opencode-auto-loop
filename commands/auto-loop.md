@@ -4,20 +4,24 @@ description: "Start Auto Loop - auto-continues until task completion. Use: /auto
 
 # Auto Loop
 
-Parse `$ARGUMENTS` for the task description and an optional `--max <number>` flag.
+Parse `$ARGUMENTS` for the task description and optional flags:
 
 - If `$ARGUMENTS` contains `--max <number>`, extract that number as **maxIterations** and remove it from the task string.
 - Otherwise, use **maxIterations**: 25
+- If `$ARGUMENTS` contains `--ralph`, set **forceLoop** to `true` and remove it from the task string. Force mode ignores all completion signals and runs for the full maxIterations.
 
 Invoke the `auto-loop` tool with:
 
 - **task**: the extracted task description
 - **maxIterations**: the extracted or default value
+- **forceLoop**: `true` if `--ralph` was present, omit otherwise
 
 Examples:
 - `/auto-loop Build a REST API` → task="Build a REST API", maxIterations=25
 - `/auto-loop Build a REST API --max 50` → task="Build a REST API", maxIterations=50
 - `/auto-loop --max 10 Fix all lint errors` → task="Fix all lint errors", maxIterations=10
+- `/auto-loop --ralph Fix all lint errors` → task="Fix all lint errors", maxIterations=25, forceLoop=true
+- `/auto-loop --ralph --max 10 Fix all lint errors` → task="Fix all lint errors", maxIterations=10, forceLoop=true
 
 After the tool confirms the loop is active, **immediately begin working on the task**. Do not just acknowledge — start doing the work right away.
 

@@ -19,6 +19,15 @@ Example:
 
 The AI will work on your task and automatically continue until completion.
 
+### `/auto-loop <task> --ralph`
+Force mode: ignore all completion signals and run for the full iteration count. Useful when you got interrupted and want to resume, or when you want the AI to keep iterating without stopping early.
+
+Examples:
+```
+/auto-loop --ralph Continue the refactoring
+/auto-loop --ralph --max 10 Fix all lint errors
+```
+
 ### `/cancel-auto-loop`
 Cancel an active Auto Loop before it completes.
 
