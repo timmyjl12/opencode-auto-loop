@@ -1,13 +1,23 @@
 ---
-description: Start Auto Loop - auto-continues until task completion
+description: "Start Auto Loop - auto-continues until task completion. Use: /auto-loop <task description>"
 ---
 
 # Auto Loop
 
-Invoke the `auto-loop` tool with the following arguments:
+Parse `$ARGUMENTS` for the task description and an optional `--max <number>` flag.
 
-- **task**: $ARGUMENTS
-- **maxIterations**: 100
+- If `$ARGUMENTS` contains `--max <number>`, extract that number as **maxIterations** and remove it from the task string.
+- Otherwise, use **maxIterations**: 25
+
+Invoke the `auto-loop` tool with:
+
+- **task**: the extracted task description
+- **maxIterations**: the extracted or default value
+
+Examples:
+- `/auto-loop Build a REST API` → task="Build a REST API", maxIterations=25
+- `/auto-loop Build a REST API --max 50` → task="Build a REST API", maxIterations=50
+- `/auto-loop --max 10 Fix all lint errors` → task="Fix all lint errors", maxIterations=10
 
 After the tool confirms the loop is active, **immediately begin working on the task**. Do not just acknowledge — start doing the work right away.
 

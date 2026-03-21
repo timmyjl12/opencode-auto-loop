@@ -57,7 +57,7 @@ Located at `.opencode/auto-loop.local.md` (add to `.gitignore`):
 ---
 active: true
 iteration: 3
-maxIterations: 100
+maxIterations: 25
 sessionId: ses_abc123
 ---
 

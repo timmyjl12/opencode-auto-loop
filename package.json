@@ -1,6 +1,6 @@
 {
   "name": "opencode-auto-loop",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Auto-continue for OpenCode",
   "main": "src/index.ts",
   "type": "module",
@@ -27,7 +27,7 @@
     "skills/"
   ],
   "dependencies": {
-    "@opencode-ai/plugin": "^0.15.31"
+    "@opencode-ai/plugin": "^1.2.27"
   },
   "engines": {
     "node": ">=18.0.0"

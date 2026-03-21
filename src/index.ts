@@ -2,11 +2,10 @@ import { type Plugin, type PluginInput, tool } from "@opencode-ai/plugin";
 import {
   existsSync,
   readFileSync,
-  writeFileSync,
   mkdirSync,
-  unlinkSync,
   cpSync,
 } from "fs";
+import { readFile, writeFile, unlink, mkdir } from "fs/promises";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
@@ -16,6 +15,7 @@ interface LoopState {
   active: boolean;
   iteration: number;
   maxIterations: number;
+  debounceMs: number;
   sessionId?: string;
   prompt?: string;
   completed?: string;
@@ -31,7 +31,8 @@ const SERVICE_NAME = "auto-loop";
 const STATE_FILENAME = "auto-loop.local.md";
 const OPENCODE_CONFIG_DIR = join(homedir(), ".config/opencode");
 const COMPLETION_TAG = /^\s*<promise>\s*DONE\s*<\/promise>\s*$/im;
-const DEBOUNCE_MS = 2000;
+const DEFAULT_DEBOUNCE_MS = 2000;
+const DEFAULT_MAX_ITERATIONS = 25;
 
 // Get plugin root directory (ESM only — package is "type": "module")
 function getPluginRoot(): string {
@@ -104,13 +105,14 @@ function getStateFile(directory: string): string {
 // Parse markdown frontmatter state
 function parseState(content: string): LoopState {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return { active: false, iteration: 0, maxIterations: 100 };
+  if (!match) return { active: false, iteration: 0, maxIterations: DEFAULT_MAX_ITERATIONS, debounceMs: DEFAULT_DEBOUNCE_MS };
 
   const frontmatter = match[1];
   const state: LoopState = {
     active: false,
     iteration: 0,
-    maxIterations: 100,
+    maxIterations: DEFAULT_MAX_ITERATIONS,
+    debounceMs: DEFAULT_DEBOUNCE_MS,
   };
 
   for (const line of frontmatter.split("\n")) {
@@ -118,7 +120,8 @@ function parseState(content: string): LoopState {
     const value = valueParts.join(":").trim();
     if (key === "active") state.active = value === "true";
     if (key === "iteration") state.iteration = parseInt(value) || 0;
-    if (key === "maxIterations") state.maxIterations = parseInt(value) || 100;
+    if (key === "maxIterations") state.maxIterations = parseInt(value) || DEFAULT_MAX_ITERATIONS;
+    if (key === "debounceMs") state.debounceMs = parseInt(value) || DEFAULT_DEBOUNCE_MS;
     if (key === "sessionId") state.sessionId = value || undefined;
   }
 
@@ -152,6 +155,7 @@ function serializeState(state: LoopState): string {
     `active: ${state.active}`,
     `iteration: ${state.iteration}`,
     `maxIterations: ${state.maxIterations}`,
+    `debounceMs: ${state.debounceMs}`,
   ];
   if (state.sessionId) lines.push(`sessionId: ${state.sessionId}`);
   lines.push("---");
@@ -162,32 +166,37 @@ function serializeState(state: LoopState): string {
 }
 
 // Read state from project directory
-function readState(directory: string): LoopState {
+async function readState(directory: string): Promise<LoopState> {
   const stateFile = getStateFile(directory);
-  if (existsSync(stateFile)) {
-    return parseState(readFileSync(stateFile, "utf-8"));
+  try {
+    const content = await readFile(stateFile, "utf-8");
+    return parseState(content);
+  } catch {
+    return { active: false, iteration: 0, maxIterations: DEFAULT_MAX_ITERATIONS, debounceMs: DEFAULT_DEBOUNCE_MS };
   }
-  return { active: false, iteration: 0, maxIterations: 100 };
 }
 
 // Write state to project directory
-function writeState(directory: string, state: LoopState, log: LogFn): void {
+async function writeState(directory: string, state: LoopState, log: LogFn): Promise<void> {
   try {
     const stateFile = getStateFile(directory);
-    mkdirSync(dirname(stateFile), { recursive: true });
-    writeFileSync(stateFile, serializeState(state));
+    await mkdir(dirname(stateFile), { recursive: true });
+    await writeFile(stateFile, serializeState(state));
   } catch (err) {
     log("error", `Failed to write state: ${err}`);
   }
 }
 
 // Clear state
-function clearState(directory: string, log: LogFn): void {
+async function clearState(directory: string, log: LogFn): Promise<void> {
   try {
     const stateFile = getStateFile(directory);
-    if (existsSync(stateFile)) unlinkSync(stateFile);
+    await unlink(stateFile);
   } catch (err) {
-    log("warn", `Failed to clear state: ${err}`);
+    // ENOENT is fine — file already gone
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      log("warn", `Failed to clear state: ${err}`);
+    }
   }
 }
 
@@ -198,7 +207,8 @@ function stripCodeFences(text: string): string {
     .replace(/`[^`]+`/g, "");       // inline backtick code
 }
 
-// Extract text from the last assistant message in a session
+// Extract text from the last assistant message in a session.
+// Fetches only the most recent messages to avoid pulling the entire history.
 async function getLastAssistantText(
   client: OpencodeClient,
   sessionId: string,
@@ -208,7 +218,7 @@ async function getLastAssistantText(
   try {
     const response = await client.session.messages({
       path: { id: sessionId },
-      query: { directory },
+      query: { directory, limit: 10 },
     });
 
     const messages = response.data ?? [];
@@ -350,6 +360,27 @@ Before going idle, list your progress using ## Completed and ## Next Steps secti
 Do NOT output false completion promises. If blocked, explain the blocker.`;
 }
 
+// Check if session is currently busy (not idle)
+async function isSessionBusy(
+  client: OpencodeClient,
+  sessionId: string,
+  log: LogFn
+): Promise<boolean> {
+  try {
+    const response = await client.session.status({});
+    const statuses = response.data ?? {};
+    const status = statuses[sessionId];
+    if (status && status.type !== "idle") {
+      log("debug", `Session ${sessionId} is ${status.type}, skipping continuation`);
+      return true;
+    }
+    return false;
+  } catch (err) {
+    log("warn", `Failed to check session status: ${err}`);
+    return false; // Assume not busy if we can't check
+  }
+}
+
 // Main plugin
 export const AutoLoopPlugin: Plugin = async (ctx) => {
   const directory = ctx.directory || process.cwd();
@@ -386,6 +417,11 @@ export const AutoLoopPlugin: Plugin = async (ctx) => {
 
   // Debounce tracking for idle events
   let lastContinuation = 0;
+  // Guard: prevent sending while a continuation is already in-flight.
+  // Set to true when we send promptAsync, cleared when we receive a
+  // session.idle or session.status(idle) event — NOT in the finally block,
+  // which fires too early (~50ms after the 204, while AI is still busy).
+  let continuationInFlight = false;
 
   return {
     tool: {
@@ -399,17 +435,27 @@ export const AutoLoopPlugin: Plugin = async (ctx) => {
           maxIterations: tool.schema
             .number()
             .optional()
-            .describe("Maximum iterations (default: 100)"),
+            .describe("Maximum iterations (default: 25)"),
+          debounceMs: tool.schema
+            .number()
+            .optional()
+            .describe("Debounce delay between iterations in ms (default: 2000)"),
         },
-        async execute({ task, maxIterations = 100 }, context) {
+        async execute({ task, maxIterations = DEFAULT_MAX_ITERATIONS, debounceMs = DEFAULT_DEBOUNCE_MS }, context) {
+          if (context.abort.aborted) return "Auto Loop start was cancelled.";
+
           const state: LoopState = {
             active: true,
             iteration: 0,
             maxIterations,
+            debounceMs,
             sessionId: context.sessionID,
             prompt: task,
           };
-          writeState(directory, state, log);
+          await writeState(directory, state, log);
+          // Reset guards so the first idle event is not blocked
+          continuationInFlight = false;
+          lastContinuation = 0;
 
           log("info", `Loop started for session ${context.sessionID}`);
           toast(`Auto Loop started (max ${maxIterations} iterations)`, "success");
@@ -439,13 +485,15 @@ Use /cancel-auto-loop to stop early.`;
       "cancel-auto-loop": tool({
         description: "Cancel active Auto Loop",
         args: {},
-        async execute() {
-          const state = readState(directory);
+        async execute(_args, context) {
+          if (context.abort.aborted) return "Cancel was aborted.";
+          const state = await readState(directory);
           if (!state.active) {
             return "No active Auto Loop to cancel.";
           }
           const iterations = state.iteration;
-          clearState(directory, log);
+          await clearState(directory, log);
+          continuationInFlight = false;
 
           log("info", `Loop cancelled after ${iterations} iteration(s)`);
           toast(`Auto Loop cancelled after ${iterations} iteration(s)`, "warning");
@@ -462,9 +510,15 @@ Use /cancel-auto-loop to stop early.`;
 
 ## Available Commands
 
-- \`/auto-loop <task>\` - Start an auto-continuation loop
+- \`/auto-loop <task>\` - Start an auto-continuation loop (default: 25 iterations)
+- \`/auto-loop <task> --max <n>\` - Start with a custom iteration limit
 - \`/cancel-auto-loop\` - Stop an active loop
 - \`/auto-loop-help\` - Show this help
+
+## Examples
+
+- \`/auto-loop Build a REST API\` — runs up to 25 iterations
+- \`/auto-loop Fix all lint errors --max 10\` — runs up to 10 iterations
 
 ## How It Works
 
@@ -484,15 +538,22 @@ Located at: .opencode/auto-loop.local.md`;
     event: async ({ event }) => {
       // --- session.idle: core auto-continuation logic ---
       if (event.type === "session.idle") {
-        const now = Date.now();
-        if (now - lastContinuation < DEBOUNCE_MS) return;
-
         const sessionId = event.properties.sessionID;
-        const state = readState(directory);
+
+        // Session confirmed idle — safe to clear in-flight guard
+        continuationInFlight = false;
+
+        const state = await readState(directory);
 
         if (!state.active) return;
         if (!sessionId) return;
         if (state.sessionId && state.sessionId !== sessionId) return;
+
+        const now = Date.now();
+        if (now - lastContinuation < state.debounceMs) return;
+
+        // Double-check the session is truly idle before sending
+        if (await isSessionBusy(client, sessionId, log)) return;
 
         // Fetch last assistant message (used for completion check + progress extraction)
         const lastText = await getLastAssistantText(client, sessionId, directory, log);
@@ -500,14 +561,14 @@ Located at: .opencode/auto-loop.local.md`;
         // Skip completion check on iteration 0 (first idle after loop start)
         // to avoid false positives from the tool's initial response text
         if (state.iteration > 0 && lastText && checkCompletion(lastText)) {
-          clearState(directory, log);
+          await clearState(directory, log);
           log("info", `Loop completed at iteration ${state.iteration}`);
           toast(`Auto Loop completed after ${state.iteration} iteration(s)`, "success");
           return;
         }
 
         if (state.iteration >= state.maxIterations) {
-          clearState(directory, log);
+          await clearState(directory, log);
           log("warn", `Loop hit max iterations (${state.maxIterations})`);
           toast(`Auto Loop stopped — max iterations (${state.maxIterations}) reached`, "warning");
           return;
@@ -521,12 +582,10 @@ Located at: .opencode/auto-loop.local.md`;
           ...state,
           iteration: state.iteration + 1,
           sessionId,
-          // Update next steps if we found new ones, otherwise keep previous
           nextSteps: newNextSteps || state.nextSteps,
-          // Merge completed: append new completed items to existing
           completed: mergeCompleted(state.completed, newCompleted),
         };
-        writeState(directory, newState, log);
+        await writeState(directory, newState, log);
         lastContinuation = Date.now();
 
         // Build continuation prompt with progress context
@@ -546,7 +605,13 @@ Original task:
 ${state.prompt || "(no task specified)"}`;
 
         try {
-          await client.session.prompt({
+          // Use promptAsync (fire-and-forget) so the event handler returns
+          // immediately. This allows the next session.idle event to fire
+          // naturally when the AI finishes, enabling the loop to continue.
+          // The synchronous prompt() blocks until the AI response completes,
+          // which prevents subsequent idle events from being processed.
+          continuationInFlight = true;
+          await client.session.promptAsync({
             path: { id: sessionId },
             body: {
               parts: [{ type: "text", text: continuationPrompt }],
@@ -555,21 +620,31 @@ ${state.prompt || "(no task specified)"}`;
           log("info", `Sent continuation ${newState.iteration}/${newState.maxIterations}`);
           toast(`Auto Loop: iteration ${newState.iteration}/${newState.maxIterations}`);
         } catch (err) {
+          // On failure, clear the guard so the next idle event can retry
+          continuationInFlight = false;
           log("error", `Failed to send continuation prompt: ${err}`);
+        }
+      }
+
+      // --- session.status: clear in-flight guard when session returns to idle ---
+      if (event.type === "session.status") {
+        if (event.properties.status?.type === "idle") {
+          continuationInFlight = false;
         }
       }
 
       // --- session.compacted: re-inject loop context after compaction ---
       if (event.type === "session.compacted") {
         const sessionId = event.properties.sessionID;
-        const state = readState(directory);
+        const state = await readState(directory);
 
         if (!state.active) return;
         if (state.sessionId && state.sessionId !== sessionId) return;
 
         // After compaction, the AI loses loop context — send a reminder
+        // Use promptAsync so we don't block event processing
         try {
-          await client.session.prompt({
+          await client.session.promptAsync({
             path: { id: sessionId },
             body: {
               parts: [{ type: "text", text: buildLoopContextReminder(state) }],
@@ -584,7 +659,11 @@ ${state.prompt || "(no task specified)"}`;
       // --- session.error: pause the loop on error ---
       if (event.type === "session.error") {
         const sessionId = event.properties.sessionID;
-        const state = readState(directory);
+        // sessionID is optional in the SDK types — if missing, we can't
+        // reliably attribute the error to our session, so skip.
+        if (!sessionId) return;
+
+        const state = await readState(directory);
 
         if (
           state.active &&
@@ -592,20 +671,22 @@ ${state.prompt || "(no task specified)"}`;
         ) {
           log("warn", `Session error detected, pausing loop at iteration ${state.iteration}`);
           toast("Auto Loop paused — session error", "error");
+          continuationInFlight = false;
           // Mark inactive but keep state so user can inspect/resume
-          writeState(directory, { ...state, active: false }, log);
+          await writeState(directory, { ...state, active: false }, log);
         }
       }
 
       // --- session.deleted: clean up if it's our session ---
       if (event.type === "session.deleted") {
-        const state = readState(directory);
+        const state = await readState(directory);
         if (!state.active) return;
 
         const deletedSessionId = event.properties.info?.id;
         if (state.sessionId && deletedSessionId && state.sessionId !== deletedSessionId) return;
 
-        clearState(directory, log);
+        await clearState(directory, log);
+        continuationInFlight = false;
         log("info", "Session deleted, cleaning up loop state");
       }
     },

@@ -43,7 +43,7 @@ The AI will work on your task and automatically continue until completion.
 1. `/auto-loop` creates a state file at `.opencode/auto-loop.local.md`
 2. When the AI goes idle, the plugin checks if `<promise>DONE</promise>` was output
 3. If not found, it extracts progress (## Completed / ## Next Steps) and injects a continuation prompt
-4. Loop continues until DONE is found or max iterations (100) reached
+4. Loop continues until DONE is found or max iterations (25) reached
 5. State file is deleted when complete
 6. Loop context survives session compaction
 
@@ -75,7 +75,7 @@ Format (markdown with YAML frontmatter):
 ---
 active: true
 iteration: 3
-maxIterations: 100
+maxIterations: 25
 sessionId: ses_abc123
 ---
 
