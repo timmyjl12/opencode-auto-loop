@@ -21,7 +21,9 @@ Your previous work remains accessible through files, git history, and the state 
 
 ## Starting the Loop
 
-**Always use the `auto-loop` tool** to start the loop. Do NOT create the state file manually. The tool handles state file creation, session tracking, and initialization.
+**Use the `auto-loop` tool ONCE to start the loop.** Do NOT create the state file manually. The tool handles state file creation, session tracking, and initialization.
+
+**CRITICAL: Do NOT call the `auto-loop` tool more than once per loop.** The plugin handles all subsequent iterations automatically via idle detection. Re-invoking the tool would be rejected to prevent accidental state resets. If you need to restart with different parameters, use `/cancel-auto-loop` first.
 
 After the tool confirms the loop is active, **immediately begin working on the task**. Do not just acknowledge — start doing the work.
 

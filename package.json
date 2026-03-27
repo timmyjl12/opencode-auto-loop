@@ -1,6 +1,6 @@
 {
   "name": "opencode-auto-loop",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "description": "Auto-continue for OpenCode",
   "main": "src/index.ts",
   "type": "module",

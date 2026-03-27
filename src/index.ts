@@ -107,7 +107,7 @@ function getStateFile(directory: string): string {
 
 // Parse markdown frontmatter state
 function parseState(content: string): LoopState {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!match) return { active: false, iteration: 0, maxIterations: DEFAULT_MAX_ITERATIONS, debounceMs: DEFAULT_DEBOUNCE_MS };
 
   const frontmatter = match[1];
@@ -118,13 +118,22 @@ function parseState(content: string): LoopState {
     debounceMs: DEFAULT_DEBOUNCE_MS,
   };
 
-  for (const line of frontmatter.split("\n")) {
+  for (const line of frontmatter.split(/\r?\n/)) {
     const [key, ...valueParts] = line.split(":");
     const value = valueParts.join(":").trim();
     if (key === "active") state.active = value === "true";
-    if (key === "iteration") state.iteration = parseInt(value) || 0;
-    if (key === "maxIterations") state.maxIterations = parseInt(value) || DEFAULT_MAX_ITERATIONS;
-    if (key === "debounceMs") state.debounceMs = parseInt(value) || DEFAULT_DEBOUNCE_MS;
+    if (key === "iteration") {
+      const parsed = parseInt(value, 10);
+      state.iteration = Number.isNaN(parsed) ? 0 : Math.max(0, parsed);
+    }
+    if (key === "maxIterations") {
+      const parsed = parseInt(value, 10);
+      state.maxIterations = (Number.isFinite(parsed) && parsed > 0) ? parsed : DEFAULT_MAX_ITERATIONS;
+    }
+    if (key === "debounceMs") {
+      const parsed = parseInt(value, 10);
+      state.debounceMs = (Number.isFinite(parsed) && parsed >= 0) ? parsed : DEFAULT_DEBOUNCE_MS;
+    }
     if (key === "forceLoop") state.forceLoop = value === "true";
     if (key === "sessionId") state.sessionId = value || undefined;
   }
@@ -247,9 +256,12 @@ async function getLastAssistantText(
   }
 }
 
-// Check completion by looking for <promise>DONE</promise> in last assistant text
+// Check completion by looking for <promise>DONE</promise> OR STATUS: COMPLETE
+// in the last assistant text. Either signal indicates the AI believes the task
+// is finished. The validateCompletion() function further validates legitimacy.
 function checkCompletion(text: string): boolean {
-  return COMPLETION_TAG.test(stripCodeFences(text));
+  const cleaned = stripCodeFences(text);
+  return COMPLETION_TAG.test(cleaned) || STATUS_COMPLETE_TAG.test(cleaned);
 }
 
 // Extract the STATUS signal presence from text.
@@ -418,10 +430,12 @@ function buildLoopContextReminder(state: LoopState): string {
   const forceLabel = state.forceLoop ? " [FORCE MODE]" : "";
   const rules = state.forceLoop
     ? `IMPORTANT RULES:
+- Do NOT call the auto-loop tool — the plugin handles continuation automatically
 - Before going idle, output ## Completed and ## Next Steps sections
 - FORCE MODE is active — the loop will continue for all ${state.maxIterations} iterations regardless of completion signals
 - Focus on making steady progress each iteration`
     : `IMPORTANT RULES:
+- Do NOT call the auto-loop tool — the plugin handles continuation automatically
 - Before going idle, output ## Completed and ## Next Steps sections
 - You MUST include a STATUS line: either \`STATUS: IN_PROGRESS\` or \`STATUS: COMPLETE\` on its own line
 - Do NOT output <promise>DONE</promise> if there are ANY unchecked items (\`- [ ]\`) in your Next Steps — the plugin WILL reject it
@@ -492,11 +506,10 @@ export const AutoLoopPlugin: Plugin = async (ctx) => {
 
   // Debounce tracking for idle events
   let lastContinuation = 0;
-  // Guard: prevent sending while a continuation is already in-flight.
-  // Set to true when we send promptAsync, cleared when we receive a
-  // session.idle or session.status(idle) event — NOT in the finally block,
-  // which fires too early (~50ms after the 204, while AI is still busy).
-  let continuationInFlight = false;
+  // Reentrant guard: prevent concurrent idle event processing.
+  // Two idle events can interleave at await points, causing duplicate
+  // state reads/writes. This ensures only one handler runs at a time.
+  let handlingIdle = false;
 
   return {
     tool: {
@@ -523,33 +536,58 @@ export const AutoLoopPlugin: Plugin = async (ctx) => {
         async execute({ task, maxIterations = DEFAULT_MAX_ITERATIONS, debounceMs = DEFAULT_DEBOUNCE_MS, forceLoop = false }, context) {
           if (context.abort.aborted) return "Auto Loop start was cancelled.";
 
+          // Coerce parameters to correct types (AI may pass strings)
+          const parsedMax = parseInt(String(maxIterations), 10);
+          const safeMaxIterations = (typeof maxIterations === "number" && maxIterations > 0)
+            ? maxIterations
+            : (Number.isFinite(parsedMax) && parsedMax > 0 ? parsedMax : DEFAULT_MAX_ITERATIONS);
+          const parsedDebounce = parseInt(String(debounceMs), 10);
+          const safeDebounceMs = (typeof debounceMs === "number" && debounceMs >= 0)
+            ? debounceMs
+            : (Number.isFinite(parsedDebounce) && parsedDebounce >= 0 ? parsedDebounce : DEFAULT_DEBOUNCE_MS);
+
+          // Guard: if a loop is already active for this session, do NOT reset state.
+          // This prevents the AI from accidentally re-invoking the tool each iteration
+          // (which would reset the iteration counter back to 0 every time).
+          const existingState = await readState(directory);
+          if (existingState.active && existingState.sessionId === context.sessionID) {
+            log("warn", `Tool re-invoked while loop already active (iteration ${existingState.iteration}/${existingState.maxIterations}). Ignoring to prevent state reset.`);
+            return `Auto Loop is ALREADY ACTIVE (iteration ${existingState.iteration}/${existingState.maxIterations}). Do NOT call the auto-loop tool again — the plugin handles continuation automatically. Just keep working on the task. Use /cancel-auto-loop first if you need to restart with different parameters.`;
+          }
+          if (existingState.active && existingState.sessionId && existingState.sessionId !== context.sessionID) {
+            log("warn", `Starting new loop in session ${context.sessionID}, overwriting active loop from session ${existingState.sessionId} (was at iteration ${existingState.iteration}/${existingState.maxIterations})`);
+            toast(`Auto Loop: replacing active loop from another session`, "warning");
+          }
+
           const state: LoopState = {
             active: true,
             iteration: 0,
-            maxIterations,
-            debounceMs,
+            maxIterations: safeMaxIterations,
+            debounceMs: safeDebounceMs,
             forceLoop: forceLoop ? true : undefined,
             sessionId: context.sessionID,
             prompt: task,
           };
           await writeState(directory, state, log);
           // Reset guards so the first idle event is not blocked
-          continuationInFlight = false;
+          handlingIdle = false;
           lastContinuation = 0;
 
           const modeLabel = forceLoop ? " [FORCE MODE]" : "";
           log("info", `Loop started${modeLabel} for session ${context.sessionID}`);
-          toast(`Auto Loop started${modeLabel} (max ${maxIterations} iterations)`, "success");
+          toast(`Auto Loop started${modeLabel} (max ${safeMaxIterations} iterations)`, "success");
 
           const forceNote = forceLoop
-            ? `\n\n**FORCE MODE (--ralph):** Completion signals are IGNORED. The loop will run for all ${maxIterations} iterations regardless. Focus on making progress each iteration — you do NOT need to output STATUS or DONE signals.`
+            ? `\n\n**FORCE MODE (--ralph):** Completion signals are IGNORED. The loop will run for all ${safeMaxIterations} iterations regardless. Focus on making steady progress each iteration — you do NOT need to output STATUS or DONE signals.`
             : "";
 
-          return `Auto Loop started (max ${maxIterations} iterations).${forceNote}
+          return `Auto Loop started (max ${safeMaxIterations} iterations).${forceNote}
 
 Task: ${task}
 
-**Begin working on the task now.** The loop will auto-continue until ${forceLoop ? `all ${maxIterations} iterations are used` : "you signal completion"}.
+**Begin working on the task now.** The loop will auto-continue until ${forceLoop ? `all ${safeMaxIterations} iterations are used` : "you signal completion"}.
+
+**CRITICAL: Do NOT call the auto-loop tool again.** The plugin handles auto-continuation automatically via idle detection. Re-invoking the tool would reset your progress. Just work on the task — the plugin will prompt you to continue when you go idle.
 
 Before going idle each iteration, output structured progress${forceLoop ? "" : " AND a status line"}:
 
@@ -586,7 +624,8 @@ Use /cancel-auto-loop to stop early.`;
           }
           const iterations = state.iteration;
           await clearState(directory, log);
-          continuationInFlight = false;
+          handlingIdle = false;
+          lastContinuation = 0;
 
           log("info", `Loop cancelled after ${iterations} iteration(s)`);
           toast(`Auto Loop cancelled after ${iterations} iteration(s)`, "warning");
@@ -644,76 +683,93 @@ Located at: .opencode/auto-loop.local.md`;
       if (event.type === "session.idle") {
         const sessionId = event.properties.sessionID;
 
-        // Session confirmed idle — safe to clear in-flight guard
-        continuationInFlight = false;
-
-        const state = await readState(directory);
-
-        if (!state.active) return;
-        if (!sessionId) return;
-        if (state.sessionId && state.sessionId !== sessionId) return;
-
-        const now = Date.now();
-        if (now - lastContinuation < state.debounceMs) return;
-
-        // Double-check the session is truly idle before sending
-        if (await isSessionBusy(client, sessionId, log)) return;
-
-        // Fetch last assistant message (used for completion check + progress extraction)
-        const lastText = await getLastAssistantText(client, sessionId, directory, log);
-
-        // Skip completion check on iteration 0 (first idle after loop start)
-        // to avoid false positives from the tool's initial response text.
-        // Also skip entirely when forceLoop is true — force mode ignores
-        // all completion signals and runs until max iterations.
-        if (!state.forceLoop && state.iteration > 0 && lastText && checkCompletion(lastText)) {
-          // Validate the DONE signal — reject if there are unchecked steps
-          // or if the STATUS signal contradicts completion
-          const validation = validateCompletion(lastText);
-          if (validation.valid) {
-            await clearState(directory, log);
-            log("info", `Loop completed at iteration ${state.iteration}`);
-            toast(`Auto Loop completed after ${state.iteration} iteration(s)`, "success");
-            return;
-          } else {
-            log("warn", `Rejected premature DONE signal: ${validation.reason}`);
-            toast(`Auto Loop: DONE rejected — ${validation.reason}`, "warning");
-            // Fall through to send another continuation prompt
-          }
-        }
-
-        if (state.iteration >= state.maxIterations) {
-          await clearState(directory, log);
-          log("warn", `Loop hit max iterations (${state.maxIterations})`);
-          toast(`Auto Loop stopped — max iterations (${state.maxIterations}) reached`, "warning");
+        // Reentrant guard: if we're already processing an idle event,
+        // skip this one. Two idle events can interleave at await points,
+        // causing duplicate state reads/writes and double continuations.
+        if (handlingIdle) {
+          log("debug", "Idle handler already running, skipping duplicate event");
           return;
         }
+        handlingIdle = true;
 
-        // Extract progress from last message and merge with existing state
-        const newNextSteps = lastText ? extractNextSteps(lastText) : undefined;
-        const newCompleted = lastText ? extractCompleted(lastText) : undefined;
+        try {
+          const state = await readState(directory);
 
-        const newState: LoopState = {
-          ...state,
-          iteration: state.iteration + 1,
-          sessionId,
-          nextSteps: newNextSteps || state.nextSteps,
-          completed: mergeCompleted(state.completed, newCompleted),
-        };
-        await writeState(directory, newState, log);
-        lastContinuation = Date.now();
+          if (!state.active) return;
+          if (!sessionId) return;
+          if (state.sessionId && state.sessionId !== sessionId) return;
 
-        // Build continuation prompt with progress context
-        const progressSection = buildProgressSection(newState);
+          const now = Date.now();
+          if (now - lastContinuation < state.debounceMs) return;
 
-        const forceLabel = state.forceLoop ? " [FORCE MODE]" : "";
-        const importantRules = state.forceLoop
-          ? `IMPORTANT:
+          // Double-check the session is truly idle before sending
+          if (await isSessionBusy(client, sessionId, log)) return;
+
+          // Fetch last assistant message (used for completion check + progress extraction)
+          const lastText = await getLastAssistantText(client, sessionId, directory, log);
+
+          // Skip completion check on iteration 0 (first idle after loop start)
+          // to avoid false positives from the tool's initial response text.
+          // Also skip entirely when forceLoop is true — force mode ignores
+          // all completion signals and runs until max iterations.
+          if (!state.forceLoop && state.iteration > 0 && lastText && checkCompletion(lastText)) {
+            // Validate the DONE signal — reject if there are unchecked steps
+            // or if the STATUS signal contradicts completion
+            const validation = validateCompletion(lastText);
+            if (validation.valid) {
+              await clearState(directory, log);
+              log("info", `Loop completed at iteration ${state.iteration}`);
+              toast(`Auto Loop completed after ${state.iteration} iteration(s)`, "success");
+              return;
+            } else {
+              log("warn", `Rejected premature DONE signal: ${validation.reason}`);
+              toast(`Auto Loop: DONE rejected — ${validation.reason}`, "warning");
+              // Fall through to send another continuation prompt
+            }
+          }
+
+          if (state.iteration >= state.maxIterations) {
+            await clearState(directory, log);
+            log("warn", `Loop hit max iterations (${state.maxIterations})`);
+            toast(`Auto Loop stopped — max iterations (${state.maxIterations}) reached`, "warning");
+            return;
+          }
+
+          // Extract progress from last message and merge with existing state
+          const newNextSteps = lastText ? extractNextSteps(lastText) : undefined;
+          const newCompleted = lastText ? extractCompleted(lastText) : undefined;
+
+          const newState: LoopState = {
+            ...state,
+            iteration: state.iteration + 1,
+            sessionId,
+            nextSteps: newNextSteps || state.nextSteps,
+            completed: mergeCompleted(state.completed, newCompleted),
+          };
+          await writeState(directory, newState, log);
+          lastContinuation = Date.now();
+
+          // Verify the state write persisted correctly
+          const verifyState = await readState(directory);
+          if (verifyState.iteration !== newState.iteration) {
+            log("error", `State file write verification FAILED: expected iteration ${newState.iteration}, read back ${verifyState.iteration}`);
+            toast(`Auto Loop: state write failed! Check .opencode/ permissions.`, "error");
+            return;
+          }
+
+          // Build continuation prompt with progress context
+          const progressSection = buildProgressSection(newState);
+
+          const forceLabel = state.forceLoop ? " [FORCE MODE]" : "";
+          const importantRules = state.forceLoop
+            ? `IMPORTANT:
+- Do NOT call the auto-loop tool — the plugin handles continuation automatically
 - Pick up from the next incomplete step below
 - Before going idle, list your progress using ## Completed and ## Next Steps sections
 - FORCE MODE is active — the loop will continue for all ${newState.maxIterations} iterations regardless of completion signals
 - Focus on making steady progress each iteration`
-          : `IMPORTANT:
+            : `IMPORTANT:
+- Do NOT call the auto-loop tool — the plugin handles continuation automatically
 - Pick up from the next incomplete step below
 - Before going idle, list your progress using ## Completed and ## Next Steps sections
 - You MUST include a STATUS line: either \`STATUS: IN_PROGRESS\` or \`STATUS: COMPLETE\` on its own line
@@ -721,41 +777,36 @@ Located at: .opencode/auto-loop.local.md`;
 - Only output \`STATUS: COMPLETE\` and the DONE signal when ALL steps are truly finished and Next Steps is empty
 - Do not stop until the task is truly done`;
 
-        const continuationPrompt = `[AUTO LOOP${forceLabel} — ITERATION ${newState.iteration}/${newState.maxIterations}]
+          const continuationPrompt = `[AUTO LOOP${forceLabel} — ITERATION ${newState.iteration}/${newState.maxIterations}]
 
 Continue working on the task. Do NOT repeat work that is already done.
+Do NOT call the auto-loop tool again — the plugin handles auto-continuation.
 ${progressSection}
 ${importantRules}
 
 Original task:
 ${state.prompt || "(no task specified)"}`;
 
-        try {
-          // Use promptAsync (fire-and-forget) so the event handler returns
-          // immediately. This allows the next session.idle event to fire
-          // naturally when the AI finishes, enabling the loop to continue.
-          // The synchronous prompt() blocks until the AI response completes,
-          // which prevents subsequent idle events from being processed.
-          continuationInFlight = true;
-          await client.session.promptAsync({
-            path: { id: sessionId },
-            body: {
-              parts: [{ type: "text", text: continuationPrompt }],
-            },
-          });
-          log("info", `Sent continuation ${newState.iteration}/${newState.maxIterations}`);
-          toast(`Auto Loop: iteration ${newState.iteration}/${newState.maxIterations}`);
-        } catch (err) {
-          // On failure, clear the guard so the next idle event can retry
-          continuationInFlight = false;
-          log("error", `Failed to send continuation prompt: ${err}`);
-        }
-      }
-
-      // --- session.status: clear in-flight guard when session returns to idle ---
-      if (event.type === "session.status") {
-        if (event.properties.status?.type === "idle") {
-          continuationInFlight = false;
+          try {
+            // Use promptAsync (fire-and-forget) so the event handler returns
+            // immediately. This allows the next session.idle event to fire
+            // naturally when the AI finishes, enabling the loop to continue.
+            // The synchronous prompt() blocks until the AI response completes,
+            // which prevents subsequent idle events from being processed.
+            await client.session.promptAsync({
+              path: { id: sessionId },
+              body: {
+                parts: [{ type: "text", text: continuationPrompt }],
+              },
+            });
+            log("info", `Sent continuation ${newState.iteration}/${newState.maxIterations}`);
+            toast(`Auto Loop: iteration ${newState.iteration}/${newState.maxIterations}`);
+          } catch (err) {
+            log("error", `Failed to send continuation prompt: ${err}`);
+            toast(`Auto Loop: failed to send continuation — ${err}`, "error");
+          }
+        } finally {
+          handlingIdle = false;
         }
       }
 
@@ -797,7 +848,8 @@ ${state.prompt || "(no task specified)"}`;
         ) {
           log("warn", `Session error detected, pausing loop at iteration ${state.iteration}`);
           toast("Auto Loop paused — session error", "error");
-          continuationInFlight = false;
+          handlingIdle = false;
+          lastContinuation = 0;
           // Mark inactive but keep state so user can inspect/resume
           await writeState(directory, { ...state, active: false }, log);
         }
@@ -812,7 +864,8 @@ ${state.prompt || "(no task specified)"}`;
         if (state.sessionId && deletedSessionId && state.sessionId !== deletedSessionId) return;
 
         await clearState(directory, log);
-        continuationInFlight = false;
+        handlingIdle = false;
+        lastContinuation = 0;
         log("info", "Session deleted, cleaning up loop state");
       }
     },

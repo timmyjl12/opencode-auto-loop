@@ -6,3 +6,4 @@ dist/
 # Don't commit local state files
 auto-loop.local.md
 .opencode/
+nul

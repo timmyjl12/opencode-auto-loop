@@ -44,7 +44,7 @@ Show plugin help and available commands.
 1. **Start**: `/auto-loop` creates a state file at `.opencode/auto-loop.local.md`
 2. **Loop**: When the AI goes idle, the plugin checks if `<promise>DONE</promise>` was output
 3. **Continue**: If not found, it injects "Continue from where you left off"
-4. **Stop**: Loop continues until DONE is found or max iterations (100) reached
+4. **Stop**: Loop continues until DONE is found or max iterations (default: 25) reached
 5. **Cleanup**: State file is deleted when complete
 6. **Compaction**: Loop context survives session compaction — task and iteration info is preserved
 

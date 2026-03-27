@@ -9,33 +9,19 @@ Stop an active Auto Loop before completion.
 
 ## How to Use
 
-When you invoke this skill:
+When you need to cancel the loop, invoke the `cancel-auto-loop` tool. The tool will:
 
-1. First, check if a loop is active:
+1. Check if a loop is currently active
+2. Report how many iterations were completed
+3. Clean up the state file
 
-```bash
-test -f .opencode/auto-loop.local.md && echo "Loop is active" || echo "No active loop"
-```
-
-2. If active, read the current iteration count:
-
-```bash
-grep '^iteration:' .opencode/auto-loop.local.md
-```
-
-3. Delete the state file to stop the loop:
-
-```bash
-rm -f .opencode/auto-loop.local.md
-```
-
-4. Inform the user of the cancellation and which iteration was reached.
+**That's it.** Just call the `cancel-auto-loop` tool. Do NOT manually delete the state file.
 
 ## When to Use
 
 Use this command when:
 - The task requirements have changed
-- You want to restart with different parameters
+- You want to restart with different parameters (cancel first, then `/auto-loop` again)
 - The loop appears stuck and you want manual control
 - You need to work on something else
 
